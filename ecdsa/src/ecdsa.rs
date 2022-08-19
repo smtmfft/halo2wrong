@@ -359,4 +359,149 @@ mod tests {
         run::<Secp256k1, PastaFp>();
         run::<Secp256k1, PastaFq>();
     }
+
+    use ark_std::{end_timer, start_timer};
+    use halo2::halo2curves::bn256::Bn256;
+    use halo2::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof};
+    use halo2::poly::commitment::ParamsProver;
+    use halo2::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+    use halo2::poly::kzg::strategy::SingleStrategy;
+
+    use halo2::transcript::{
+        Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
+    };
+    use rand::SeedableRng;
+    use rand_xorshift::XorShiftRng;
+    use std::env::var;
+
+    fn new_ecdsa_verifier_circuit<C: CurveAffine, N: FieldExt>() -> TestCircuitEcdsaVerify<C, N> {
+        fn mod_n<C: CurveAffine>(x: C::Base) -> C::Scalar {
+            let x_big = fe_to_big(x);
+            big_to_fe(x_big)
+        }
+
+        let g = C::generator();
+
+        // Generate a key pair
+        let sk = <C as CurveAffine>::ScalarExt::random(OsRng);
+        let public_key = (g * sk).to_affine();
+
+        // Generate a valid signature
+        // Suppose `m_hash` is the message hash
+        let msg_hash = <C as CurveAffine>::ScalarExt::random(OsRng);
+
+        // Draw arandomness
+        let k = <C as CurveAffine>::ScalarExt::random(OsRng);
+        let k_inv = k.invert().unwrap();
+
+        // Calculate `r`
+        let r_point = (g * k).to_affine().coordinates().unwrap();
+        let x = r_point.x();
+        let r = mod_n::<C>(*x);
+
+        // Calculate `s`
+        let s = k_inv * (msg_hash + (r * sk));
+
+        // Sanity check. Ensure we construct a valid signature. So lets verify it
+        {
+            let s_inv = s.invert().unwrap();
+            let u_1 = msg_hash * s_inv;
+            let u_2 = r * s_inv;
+            let r_point = ((g * u_1) + (public_key * u_2))
+                .to_affine()
+                .coordinates()
+                .unwrap();
+            let x_candidate = r_point.x();
+            let r_candidate = mod_n::<C>(*x_candidate);
+            assert_eq!(r, r_candidate);
+        }
+
+        let aux_generator = C::CurveExt::random(OsRng).to_affine();
+        let circuit = TestCircuitEcdsaVerify::<C, N> {
+            public_key: Value::known(public_key),
+            signature: Value::known((r, s)),
+            msg_hash: Value::known(msg_hash),
+
+            aux_generator,
+            window_size: 2,
+            _marker: PhantomData,
+        };
+
+        circuit
+    }
+
+    #[test]
+    // #[cfg_attr(not(feature = "benches"), ignore)]
+    fn bench_circuit() {
+        use crate::curves::bn256::Fr as BnScalar;
+        use crate::curves::secp256k1::Secp256k1Affine as Secp256k1;
+        let empty_circuit = new_ecdsa_verifier_circuit::<Secp256k1, BnScalar>();
+
+        // Initialize the polynomial commitment parameters
+        let rng = XorShiftRng::from_seed([
+            0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+            0xbc, 0xe5,
+        ]);
+
+        let degree: u32 = var("DEGREE")
+            .unwrap_or(String::from("18"))
+            .parse()
+            .expect("Cannot parse DEGREE env var as u32");
+
+        // Bench setup generation
+        let setup_message = format!("Setup generation with degree = {}", degree);
+        let start1 = start_timer!(|| setup_message);
+        let general_params = {
+            let params: ParamsKZG<Bn256> = ParamsKZG::new(degree);
+            params
+        };
+        // let verifier_params =
+        //     halo2::poly::commitment::ParamsProver::verifier_params(&general_params);
+
+        end_timer!(start1);
+        let setup_message = format!("Key generation with degree = {}", degree);
+        let start1p5 = start_timer!(|| setup_message);
+        // Initialize the proving key
+        let vk = keygen_vk::<KZGCommitmentScheme<_>, _>(&general_params, &empty_circuit)
+            .expect("keygen_vk should not fail");
+        let pk = keygen_pk::<KZGCommitmentScheme<_>, _>(&general_params, vk, &empty_circuit)
+            .expect("keygen_pk should not fail");
+        end_timer!(start1p5);
+
+        // Create a proof
+        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+
+        // Bench proof generation time
+        let proof_message = format!(
+            "ecdsa sign verification Proof generation with {} rows",
+            degree
+        );
+        let start2 = start_timer!(|| proof_message);
+        create_proof::<KZGCommitmentScheme<_>, halo2::poly::kzg::multiopen::ProverGWC<_>, _, _, _, _>(
+            &general_params,
+            &pk,
+            &[empty_circuit],
+            &[&[&[]]],
+            rng,
+            &mut transcript,
+        )
+        .expect("proof generation should not fail");
+        let proof = transcript.finalize();
+        end_timer!(start2);
+
+        // Bench verification time
+        let start3 = start_timer!(|| "ecdsa sign verification Proof verification");
+        let mut verifier_transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        let strategy = SingleStrategy::new(&general_params);
+
+        verify_proof::<_, _, _, halo2::poly::kzg::multiopen::VerifierGWC<_>, _>(
+            &general_params,
+            pk.get_vk(),
+            strategy,
+            &[&[&[]]],
+            &mut verifier_transcript,
+        )
+        .expect("failed to verify bench circuit");
+        end_timer!(start3);
+    }
 }
